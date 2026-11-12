@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>microbots</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  body.idle { cursor: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c"></canvas><canvas id="g"></canvas><canvas id="o"></canvas></div>
+<script src="data/swarm.js"></script>
+<script src="data/kilobot.js"></script>
+<script src="data/linking.js"></script>
+<script src="data/sandbox.js"></script>
+<script src="data/cad.js"></script>
+<script src="sync.js"></script>
+<script>
+/* Wordless pitch deck. Every animation is real project output (see build_data.py), played back or simulated live.
+   Controls: click / tap / space / right arrow / PageDown = next.  Left arrow / PageUp = back.  F = full screen.  Home = restart.
+   The only numbers are on the last slide; edit BUDGET below. */
+const BUDGET = {
+  bots: 40,
+  items: [                       // icon, dollars   (per-bot costs are for all 40 bots)
+    ['wheel',   1120],           // 3 gearmotors + 3 omni wheels + drivers, $28 a bot
+    ['chip',     720],           // board, microcontroller, infrared neighbour sensing, $18 a bot
+    ['battery',  440],           // battery, charging, printed chassis, $11 a bot
+    ['iterate',  450],           // 3 prototype rounds before the batch of 40
+    ['camera',   350],           // floor arena, overhead tracking camera, charging dock
+    ['box',      420],           // spares, shipping, consumables
+  ],
+};
+
+const INK = '#15171b', DARK = '#23262c', MID = '#8d939c', LIGHT = '#c9ced5', GHOST = '#eef0f3', ACC = '#f26a1b';
+const D = window.DATA;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, u) => a + (b - a) * u;
+const ease = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+const easeOut = u => 1 - Math.pow(1 - u, 3);
+const backOut = u => 1 + 2.2 * Math.pow(u - 1, 3) + 1.2 * Math.pow(u - 1, 2);
+function b64(s, T) { const bin = atob(s), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new T(u.buffer); }
+function hex(c) { const n = parseInt(c.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255]; }
+
+/* ------------------------------------------------------------------ canvases */
+const stage = document.getElementById('stage'), cv = document.getElementById('c'), gv = document.getElementById('g'), ov = document.getElementById('o');
+const ctx = cv.getContext('2d'), octx = ov.getContext('2d');   // octx: words drawn over the 3D
+const gl = gv.getContext('webgl2', { antialias: true, alpha: true, premultipliedAlpha: true });
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.round(innerWidth * DPR); H = Math.round(innerHeight * DPR);
+  for (const c of [cv, gv, ov]) { c.width = W; c.height = H; }
+}
+addEventListener('resize', resize); resize();
+
+/* ------------------------------------------------------------------ tiny 3D renderer (flat shading from screen derivatives) */
+const M = {
+  id: () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+  mul(a, b) { const o = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3]; return o; },
+  tr: (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1],
+  sc: (x, y = x, z = x) => [x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1],
+  rot(ax, a) { const [x, y, z] = ax, c = Math.cos(a), s = Math.sin(a), t = 1 - c; return [t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0, t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0, t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0, 0, 0, 0, 1]; },
+  persp(fov, asp, n, f) { const t = 1 / Math.tan(fov / 2); return [t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0]; },
+  look(e, c, up) {
+    const z = norm(sub(e, c)), x = norm(cross(up, z)), y = cross(z, x);
+    return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1];
+  },
+  chain(...ms) { return ms.reduce((a, b) => M.mul(a, b)); },
+};
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+
+const prog = (() => {
+  const mk = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(sh); return sh; };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, `#version 300 es
+    in vec3 p; uniform mat4 uMV, uP; out vec3 vp;
+    void main(){ vec4 q = uMV * vec4(p, 1.0); vp = q.xyz; gl_Position = uP * q; }`));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, `#version 300 es
+    precision highp float; in vec3 vp; uniform vec3 uC; uniform float uA; out vec4 o;
+    void main(){
+      vec3 n = normalize(cross(dFdx(vp), dFdy(vp)));
+      vec3 v = normalize(-vp);
+      if (dot(n, v) < 0.0) n = -n;
+      float key = max(dot(n, normalize(vec3(0.45, 0.75, 0.55))), 0.0);
+      float fill = max(dot(n, normalize(vec3(-0.7, 0.1, 0.5))), 0.0);
+      float hemi = 0.5 + 0.5 * n.y;
+      float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+      float spec = pow(max(dot(n, normalize(normalize(vec3(0.45, 0.75, 0.55)) + v)), 0.0), 40.0);
+      vec3 c = uC * (0.34 + 0.24 * hemi + 0.62 * key + 0.16 * fill) + vec3(0.10) * rim + vec3(0.16) * spec;
+      o = vec4(c * uA, uA);
+    }`));
+  gl.linkProgram(p); gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
+  return { p, mv: gl.getUniformLocation(p, 'uMV'), pr: gl.getUniformLocation(p, 'uP'), c: gl.getUniformLocation(p, 'uC'), a: gl.getUniformLocation(p, 'uA') };
+})();
+
+function mesh(pos, idx, type = gl.FLOAT, normalized = false) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer()); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, type, normalized, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer()); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, n: idx.length, it: idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, bytes: idx.BYTES_PER_ELEMENT };
+}
+let VIEW = M.id(), PROJ = M.id();
+function begin3D() {
+  gl.viewport(0, 0, W, H); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(prog.p);
+}
+function camera(eye, target, up, fov, near, far) { VIEW = M.look(eye, target, up); PROJ = M.persp(fov, W / H, near, far); gl.uniformMatrix4fv(prog.pr, false, PROJ); }
+function draw(m, model, color, alpha = 1, first = 0, count = m.n) {
+  if (count <= 0 || alpha <= 0) return;
+  gl.uniformMatrix4fv(prog.mv, false, M.mul(VIEW, model)); gl.uniform3fv(prog.c, color); gl.uniform1f(prog.a, alpha);
+  gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES, count, m.it, first * m.bytes);
+}
+/* camera orbiting a z-up target */
+function orbit(target, dist, azim, elev, fov = 0.5) {
+  const e = [target[0] + dist * Math.cos(elev) * Math.cos(azim), target[1] + dist * Math.cos(elev) * Math.sin(azim), target[2] + dist * Math.sin(elev)];
+  camera(e, target, [0, 0, 1], fov, dist * 0.05, dist * 8);
+}
+
+/* procedural shapes (z up) */
+function cyl(r, h, seg = 72, rin = 0) {           // cylinder or tube centred on the origin, axis z
+  const p = [], ix = []; const ring = (rad, z) => { const s = p.length / 3; for (let i = 0; i < seg; i++) { const a = i / seg * Math.PI * 2; p.push(rad * Math.cos(a), rad * Math.sin(a), z); } return s; };
+  const quad = (a, b) => { for (let i = 0; i < seg; i++) { const j = (i + 1) % seg; ix.push(a + i, a + j, b + j, a + i, b + j, b + i); } };
+  const cap = (a, z) => { const c = p.length / 3; p.push(0, 0, z); for (let i = 0; i < seg; i++) ix.push(c, a + i, a + (i + 1) % seg); };
+  const b = ring(r, -h / 2), t = ring(r, h / 2); quad(b, t);
+  if (rin) { const b2 = ring(rin, -h / 2), t2 = ring(rin, h / 2); quad(b2, t2); quad(t, t2); quad(b, b2); }
+  else { cap(ring(r, -h / 2), -h / 2); cap(ring(r, h / 2), h / 2); }
+  return mesh(new Float32Array(p), new Uint16Array(ix));
+}
+const CUBE = (() => { const p = []; for (const x of [-.5, .5]) for (const y of [-.5, .5]) for (const z of [-.5, .5]) p.push(x, y, z);
+  return mesh(new Float32Array(p), new Uint16Array([0, 1, 3, 0, 3, 2, 4, 6, 7, 4, 7, 5, 0, 4, 5, 0, 5, 1, 2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 5, 7, 1, 7, 3])); })();
+const DISC = cyl(1, 1, 96), TUBE = cyl(1, 1, 96, 0.95);
+
+/* ------------------------------------------------------------------ 2D helpers */
+function dots(pts, n, cx, cy, s, r, color) {       // pts: flat [x0,y0,...] in world units (y up)
+  ctx.fillStyle = color; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const x = cx + pts[2 * i] * s, y = cy - pts[2 * i + 1] * s; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 6.2832); }
+  ctx.fill();
+}
+function seq(sq) {                                  // decode a swarm sequence once
+  if (!sq.a) { sq.a = b64(sq.xy, Int16Array); sq.buf = new Float32Array(sq.n * 2); }
+  return sq;
+}
+function seqAt(sq, u) {                             // positions at fraction u of the run
+  seq(sq); const f = clamp(u) * (sq.f - 1), i = Math.min(sq.f - 2, Math.floor(f)), a = f - i, n2 = sq.n * 2, A = sq.a, o = sq.buf, q = 1 / D.swarm.q;
+  for (let k = 0; k < n2; k++) { const p0 = A[i * n2 + k]; o[k] = (p0 + (A[(i + 1) * n2 + k] - p0) * a) * q; }
+  return o;
+}
+function ghost(sq) {                                // soft silhouette of the target shape
+  if (!sq.g) { const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d'); x.fillStyle = GHOST;
+    for (let r = 0; r < 64; r++) for (let q = 0; q < 64; q++) if (sq.occ.charCodeAt(r * 64 + q) === 49) x.fillRect(q, 63 - r, 1, 1); sq.g = c; }
+  return sq.g;
+}
+function drawGhost(sq, cx, cy, s, alpha = 1) { ctx.save(); ctx.globalAlpha = alpha; ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(ghost(sq), cx - s, cy - s, 2 * s, 2 * s); ctx.restore(); }
+function shadow(cx, cy, rx, ry, a = 0.13) {
+  ctx.save(); ctx.translate(cx, cy); ctx.scale(1, ry / rx);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx); g.addColorStop(0, `rgba(10,12,20,${a})`); g.addColorStop(1, 'rgba(10,12,20,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rx, 0, 6.2832); ctx.fill(); ctx.restore();
+}
+/* form, hold, un-form: returns the fraction of the run to show at time t in a cycle */
+function cycle(t, form = 2.2, hold = 1.5, back = 1.1, rest = 0.3) {
+  const per = form + hold + back + rest, k = Math.floor(t / per), x = t - k * per;
+  const u = x < form ? ease(x / form) : x < form + hold ? 1 : x < form + hold + back ? 1 - ease((x - form - hold) / back) : 0;
+  return [k, u];
+}
+
+/* ================================================================== SCENES ==================================================================
+   Each scene: { beats, enter?(), draw(beat, tb, ts) }   tb = seconds in this beat, ts = seconds in this scene. */
+
+/* 1. One pile of bots, any shape. The newest learned swarm (512 bots, every bot runs the same small network). */
+const hero = {
+  beats: 1,
+  draw(beat, tb, ts) {
+    const S = D.swarm.hero, [k, u] = cycle(Math.max(0, ts - 0.5)), sq = S[k % S.length];
+    const s = Math.min(W, H) * 0.52;
+    dots(seqAt(sq, u), sq.n, W / 2, H / 2, s, 0.33 * sq.sp * s, INK);
+  },
+};
+
+/* 2. Where it started: random dots, then a flock from local rules, then 150 bots assembling a shape (Kilobot algorithm). */
+const origins = {
+  beats: 3, N: 900,
+  enter() {
+    const n = this.N; this.x = new Float32Array(n); this.y = new Float32Array(n); this.vx = new Float32Array(n); this.vy = new Float32Array(n);
+    const g = () => (Math.random() + Math.random() + Math.random() + Math.random() - 2) * 0.87, u = Math.min(W, H) / 1000;
+    for (let i = 0; i < n; i++) { this.x[i] = W / 2 + g() * 40 * u; this.y[i] = H / 2 + g() * 40 * u; const a = Math.random() * 6.283; this.vx[i] = Math.cos(a) * 60 * u; this.vy[i] = Math.sin(a) * 60 * u; }
+    this.last = 0;
+    const K = D.kilobot;
+    if (!K.a) {
+      K.a = b64(K.xy, Int16Array); K.st = b64(K.state, Uint8Array);
+      const c = document.createElement('canvas'); c.width = c.height = K.g; const x = c.getContext('2d'); x.fillStyle = GHOST;
+      let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9; const res = K.ext[2] / K.g;
+      for (let r = 0; r < K.g; r++) for (let q = 0; q < K.g; q++) if (K.mask.charCodeAt(r * K.g + q) === 49) {
+        x.fillRect(q, K.g - 1 - r, 1, 1); const wx = K.ext[0] + q * res, wy = K.ext[1] + r * res; x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); y0 = Math.min(y0, wy); y1 = Math.max(y1, wy); }
+      for (let i = 0; i < K.a.length; i += 2) { const px = K.a[i] / K.s, py = K.a[i + 1] / K.s; x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py); }
+      K.img = c; K.box = [x0 - 1, x1 + 1, y0 - 1, y1 + 1];
+    }
+  },
+  walk(dt, u) {
+    const n = this.N, s = 70 * u * Math.sqrt(dt);
+    for (let i = 0; i < n; i++) {
+      this.x[i] += (Math.random() + Math.random() + Math.random() - 1.5) * 2 * s; this.y[i] += (Math.random() + Math.random() + Math.random() - 1.5) * 2 * s;
+      if (this.x[i] < 0) this.x[i] = -this.x[i]; if (this.x[i] > W) this.x[i] = 2 * W - this.x[i]; if (this.y[i] < 0) this.y[i] = -this.y[i]; if (this.y[i] > H) this.y[i] = 2 * H - this.y[i];
+    }
+  },
+  flock(dt, u) {                                    // boids: stay close, don't collide, face the same way; neighbours only
+    const n = this.N, R = 60 * u, RS = 20 * u, cell = R, cols = Math.ceil(W / cell) + 1, rows = Math.ceil(H / cell) + 1;
+    const head = new Int32Array(cols * rows).fill(-1), next = new Int32Array(n), x = this.x, y = this.y, vx = this.vx, vy = this.vy;
+    for (let i = 0; i < n; i++) { const c = clamp(Math.floor(x[i] / cell), 0, cols - 1) + clamp(Math.floor(y[i] / cell), 0, rows - 1) * cols; next[i] = head[c]; head[c] = i; }
+    const vmax = 190 * u, vmin = 110 * u;
+    for (let i = 0; i < n; i++) {
+      let ax = 0, ay = 0, cxs = 0, cys = 0, sx = 0, sy = 0, m = 0; const gx = Math.floor(x[i] / cell), gy = Math.floor(y[i] / cell);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const cx_ = gx + dx, cy_ = gy + dy; if (cx_ < 0 || cy_ < 0 || cx_ >= cols || cy_ >= rows) continue;
+        for (let j = head[cx_ + cy_ * cols]; j >= 0; j = next[j]) {
+          if (j === i) continue; const ex = x[j] - x[i], ey = y[j] - y[i], d2 = ex * ex + ey * ey; if (d2 > R * R) continue;
+          m++; ax += vx[j]; ay += vy[j]; cxs += ex; cys += ey;
+          if (d2 < RS * RS) { const d = Math.sqrt(d2) + 1e-3; sx -= ex / d * (RS - d); sy -= ey / d * (RS - d); }
+        }
+      }
+      if (m) { vx[i] += ((ax / m - vx[i]) * 2.2 + cxs / m * 0.9 + sx * 22) * dt; vy[i] += ((ay / m - vy[i]) * 2.2 + cys / m * 0.9 + sy * 22) * dt; }
+      const sp = Math.hypot(vx[i], vy[i]) || 1, k = clamp(sp, vmin, vmax) / sp; vx[i] *= k; vy[i] *= k;
+    }
+    const pad = 30 * u;
+    for (let i = 0; i < n; i++) { x[i] += vx[i] * dt; y[i] += vy[i] * dt;
+      if (x[i] < -pad) x[i] += W + 2 * pad; if (x[i] > W + pad) x[i] -= W + 2 * pad; if (y[i] < -pad) y[i] += H + 2 * pad; if (y[i] > H + pad) y[i] -= H + 2 * pad; }
+  },
+  draw(beat, tb, ts) {
+    const u = Math.min(W, H) / 1000, dt = Math.min(0.033, ts - this.last); this.last = ts;
+    if (beat === 0) this.walk(dt, u);
+    if (beat >= 1 && (beat === 1 || tb < 0.7)) this.flock(dt, u);
+    const fade = beat === 2 ? 1 - clamp(tb / 0.6) : 1;
+    if (fade > 0) {
+      ctx.globalAlpha = fade;
+      if (beat === 0) { ctx.fillStyle = INK; ctx.beginPath(); const r = 3.2 * u; for (let i = 0; i < this.N; i++) { ctx.moveTo(this.x[i] + r, this.y[i]); ctx.arc(this.x[i], this.y[i], r, 0, 6.2832); } ctx.fill(); }
+      else {                                        // dots grow a tail in the direction of travel
+        const tail = 0.085 * clamp(tb / 0.8 + (beat === 2 ? 1 : 0));
+        ctx.strokeStyle = INK; ctx.lineCap = 'round'; ctx.lineWidth = 6.4 * u; ctx.beginPath();
+        for (let i = 0; i < this.N; i++) { ctx.moveTo(this.x[i], this.y[i]); ctx.lineTo(this.x[i] - this.vx[i] * tail, this.y[i] - this.vy[i] * tail - 0.01); }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    if (beat === 2) {
+      const K = D.kilobot, [x0, x1, y0, y1] = K.box, s = Math.min(W * 0.9 / (x1 - x0), H * 0.9 / (y1 - y0));
+      const ox = W / 2 - (x0 + x1) / 2 * s, oy = H / 2 + (y0 + y1) / 2 * s, a = clamp((tb - 0.3) / 0.6);
+      ctx.globalAlpha = a;
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(K.img, ox + K.ext[0] * s, oy - (K.ext[1] + K.ext[2]) * s, K.ext[2] * s, K.ext[2] * s);
+      const T = 12, f = clamp((tb - 0.9) / T) * (K.f - 1), i = Math.min(K.f - 2, Math.floor(f)), fr = f - i, n = K.n, r = 0.46 * s;
+      for (const pass of [0, 1, 2]) {                // waiting = light, joined = ink, moving = accent
+        ctx.fillStyle = [LIGHT, INK, ACC][pass]; ctx.beginPath();
+        for (let b = 0; b < n; b++) {
+          const st = K.st[i * n + b], p = K.seed[b] || st === 3 ? 1 : st === 0 ? 0 : 2; if (p !== pass) continue;
+          const xa = K.a[(i * n + b) * 2], ya = K.a[(i * n + b) * 2 + 1], xb = K.a[((i + 1) * n + b) * 2], yb = K.a[((i + 1) * n + b) * 2 + 1];
+          const X = ox + lerp(xa, xb, fr) / K.s * s, Y = oy - lerp(ya, yb, fr) / K.s * s; ctx.moveTo(X + r, Y); ctx.arc(X, Y, r, 0, 6.2832);
+        }
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  },
+};
+
+/* 3. The bot we designed: microbot v1 (real CAD), then what its connectors let it build. */
+const PARTCOL = [hex('#2a2d33'), hex(ACC), hex('#4a4f58'), hex('#c4c8ce'), hex('#9aa0a8')];   // body, turret, arm, tip, pin
+const cad = {
+  beats: 4,
+  seqs: [['bot_straight', 'bot_V120', 'bot_U_grip'], ['ring3_triangle'], ['ring6_hexagon'], ['block_2x2x2']],
+  enter() {
+    this.cur = null; this.prev = null; this.sw = -9; this.fit = 60;
+  },
+  draw(beat, tb, ts) {
+    const names = this.seqs[beat], name = names[Math.floor(tb / 2.6) % names.length];
+    if (name !== this.cur) { this.prev = this.cur; this.cur = name; this.sw = ts; }
+    const c = D.cad[this.cur], x = ts - this.sw;
+    this.fit = lerp(this.fit, Math.max(c.r, 42), 0.07);
+    shadow(W / 2, H * 0.86, H * 0.36, H * 0.045);
+    begin3D(); orbit([0, 0, 0], this.fit * 4.6, ts * 0.55, 0.36, 0.5);
+    const one = (nm, sc) => {
+      const d = D.cad[nm]; if (!d || sc <= 0.001) return;
+      const model = M.sc(d.r * sc);
+      let o = 0; for (let k = 0; k < 5; k++) { draw(d.m, model, PARTCOL[k], 1, o, d.ranges[k]); o += d.ranges[k]; }
+    };
+    if (this.prev && x < 0.16) one(this.prev, 1 - Math.pow(x / 0.16, 2));
+    else one(this.cur, backOut(clamp((x - (this.prev ? 0.16 : 0)) / 0.4)));
+  },
+};
+
+/* 4. In 3D, staying linked: 174 cube bots build an arch, a slice is cut out, the spares rebuild it. */
+const linking = {
+  beats: 2,
+  enter() { const L = D.linking; if (!L.c) { L.c = b64(L.cell, Int8Array); L.fl = b64(L.flag, Uint8Array); } },
+  simTime(beat, tb) {
+    const L = D.linking, a = L.built + 3, r = 13;
+    if (beat === 0) { const t = tb * r; return t < a ? t : Math.min(L.dmg - 0.001, a + (t - a) * 3.5); }
+    return tb < 0.9 ? L.dmg + tb / 0.9 * 0.999 : Math.min(L.t - 0.001, L.dmg + 1 + (tb - 0.9) * 11);
+  },
+  draw(beat, tb, ts) {
+    const L = D.linking, [nx, ny] = L.grid, tt = this.simTime(beat, tb), t = Math.floor(tt), s = ease(tt - t), B = L.b;
+    shadow(W / 2, H * 0.80, H * 0.62, H * 0.07, 0.10);
+    begin3D(); orbit([nx / 2 - .5, ny / 2 - .5, 3.6], 46, -1.05 + 0.42 * Math.sin(ts * 0.22), 0.36, 0.52);
+    draw(CUBE, M.chain(M.tr(nx / 2 - .5, ny / 2 - .5, -0.62), M.sc(nx + 3, ny + 3, 0.16)), hex('#f1f2f5'));
+    const cLock = hex(DARK), cFree = hex('#c3c8d0'), cMove = hex(ACC);
+    for (let b = 0; b < B; b++) {
+      const o = (t * B + b) * 9, f = L.fl[t * B + b], kind = f & 3, alive = f >> 2 & 1, locked = f >> 3 & 1;
+      const fr = [L.c[o], L.c[o + 1], L.c[o + 2]], to = [L.c[o + 3], L.c[o + 4], L.c[o + 5]];
+      if (!alive) {                                 // bots removed by the cut drop away
+        if (t === L.dmg && (L.fl[(t - 1) * B + b] >> 2 & 1)) draw(CUBE, M.chain(M.tr(to[0], to[1], to[2] - 5 * s * s), M.sc(0.86 * (1 - s))), cMove);
+        continue;
+      }
+      let model;
+      if (kind === 1) model = M.tr(lerp(fr[0], to[0], s), lerp(fr[1], to[1], s), lerp(fr[2], to[2], s));
+      else if (kind === 2) {                        // pivot: half a turn over the shared edge
+        const via = [L.c[o + 6], L.c[o + 7], L.c[o + 8]], h = [(fr[0] + to[0]) / 2, (fr[1] + to[1]) / 2, (fr[2] + to[2]) / 2];
+        const v0 = sub(fr, h), ax = norm(cross(v0, sub(via, h)));
+        model = M.chain(M.tr(h[0], h[1], h[2]), M.rot(ax, s * Math.PI), M.tr(v0[0], v0[1], v0[2]));
+      } else model = M.tr(to[0], to[1], to[2]);
+      draw(CUBE, M.mul(model, M.sc(0.86)), kind ? cMove : locked ? cLock : cFree);
+    }
+  },
+};
+
+/* 5. Three things the swarm does, in 3D, from the browser sandbox (hand-written rules), each with a title on top:
+   self-assembly (a 902-bot stone-style arch), self-repair (the middle is cut out and the spares rebuild it), and
+   self-scaffolding (with real connector strength the swarm plans support pillars, blue, and builds them first). */
+const PILLAR = hex('#3a6fd8');
+function run3d(R) {                                 // decode once, and find the box the run moves through
+  if (!R.c) {
+    R.c = b64(R.cell, Int8Array); R.fl = b64(R.flag, Uint8Array);
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (let i = 0; i < R.c.length; i += 9) for (let k = 0; k < 3; k++) { const v = R.c[i + 3 + k]; if (v < lo[k]) lo[k] = v; if (v > hi[k]) hi[k] = v; }
+    R.lo = lo; R.hi = hi;
+    const tl = [1e9, 1e9], th = [-1e9, -1e9], o = (R.t - 1) * R.b;    // the finished shape: what the camera looks at
+    for (let b = 0; b < R.b; b++) if (R.fl[o + b] >> 3 & 1) for (let k = 0; k < 2; k++) { const v = R.c[(o + b) * 9 + 3 + k]; if (v < tl[k]) tl[k] = v; if (v > th[k]) th[k] = v; }
+    R.shape = [(tl[0] + th[0]) / 2, (tl[1] + th[1]) / 2, Math.max(th[0] - tl[0], th[1] - tl[1]) + 1];
+  }
+  return R;
+}
+function drawRun(R, tt, ts, focus) {          // focus 1: frame the finished shape; 0: everything the bots move through
+  const t = Math.floor(tt), s = ease(tt - t), B = R.b, lo = R.lo, hi = R.hi, all = Math.max(hi[0] - lo[0], hi[1] - lo[1]) + 1;
+  const cx = lerp((lo[0] + hi[0]) / 2, R.shape[0], focus), cy = lerp((lo[1] + hi[1]) / 2, R.shape[1], focus), span = lerp(all, R.shape[2] + 6, focus);
+  shadow(W / 2, H * 0.80, H * 0.62, H * 0.07, 0.10);
+  begin3D(); orbit([cx, cy, (hi[2] + 1) * 0.42], span * 1.55 + 10, -1.05 + 0.42 * Math.sin(ts * 0.22), 0.40, 0.52);
+  draw(CUBE, M.chain(M.tr((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, -0.62), M.sc(hi[0] - lo[0] + 4, hi[1] - lo[1] + 4, 0.16)), hex('#f1f2f5'));
+  const cLock = hex(DARK), cFree = hex('#c3c8d0'), cMove = hex(ACC);
+  for (let b = 0; b < B; b++) {
+    const o = (t * B + b) * 9, f = R.fl[t * B + b], kind = f & 3;
+    if (!(f >> 2 & 1)) {                            // cut out: the bots drop away on the frame they're removed
+      if (t === R.dmg && (R.fl[(t - 1) * B + b] >> 2 & 1)) draw(CUBE, M.chain(M.tr(R.c[o + 3], R.c[o + 4], R.c[o + 5] - 6 * s * s), M.sc(0.86 * (1 - s))), hex(ACC));
+      continue;
+    }
+    const fr = [R.c[o], R.c[o + 1], R.c[o + 2]], to = [R.c[o + 3], R.c[o + 4], R.c[o + 5]];
+    let model;
+    if (kind === 1) model = M.tr(lerp(fr[0], to[0], s), lerp(fr[1], to[1], s), lerp(fr[2], to[2], s));
+    else if (kind === 2) {
+      const via = [R.c[o + 6], R.c[o + 7], R.c[o + 8]], h = [(fr[0] + to[0]) / 2, (fr[1] + to[1]) / 2, (fr[2] + to[2]) / 2];
+      const v0 = sub(fr, h), ax = norm(cross(v0, sub(via, h)));
+      model = M.chain(M.tr(h[0], h[1], h[2]), M.rot(ax, s * Math.PI), M.tr(v0[0], v0[1], v0[2]));
+    } else model = M.tr(to[0], to[1], to[2]);
+    draw(CUBE, M.mul(model, M.sc(0.86)), kind ? cMove : f >> 4 & 1 ? PILLAR : f >> 3 & 1 ? cLock : cFree);
+  }
+}
+const TITLES = [['01', 'Self-Assembly'], ['02', 'Self-Repair'], ['03', 'Self-Scaffolding']];
+function title3d(beat, tb) {
+  const [n, name] = TITLES[beat], a = easeOut(clamp(tb / 0.6)), y = H * 0.115 - (1 - a) * H * 0.015;
+  const font = (px, w) => `${w} ${px}px "Inter","SF Pro Display",-apple-system,"Helvetica Neue",Arial,sans-serif`;
+  octx.save(); octx.globalAlpha = a; octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  octx.font = font(H * 0.026, 700); octx.fillStyle = ACC; octx.letterSpacing = `${H * 0.006}px`; octx.fillText(n, W / 2, y - H * 0.058);
+  octx.font = font(H * 0.075, 800); octx.fillStyle = INK; octx.letterSpacing = `${-H * 0.002}px`; octx.fillText(name, W / 2, y);
+  octx.restore();
+}
+function emergent(tb) {                            // a big stamp across the scaffolding demo
+  const a = backOut(clamp((tb - 1.2) / 0.5)), k = clamp((tb - 1.2) / 0.3);
+  if (k <= 0) return;
+  const font = (px, w) => `${w} ${px}px "Inter","SF Pro Display",-apple-system,"Helvetica Neue",Arial,sans-serif`;
+  octx.save(); octx.translate(W / 2, H * 0.885); octx.rotate(-0.035); octx.scale(a, a); octx.globalAlpha = k;
+  octx.font = font(H * 0.085, 900); octx.letterSpacing = `${H * 0.004}px`; octx.textAlign = 'center'; octx.textBaseline = 'middle';
+  const w = octx.measureText('EMERGENT BEHAVIOUR').width + H * 0.08, h = H * 0.13;
+  octx.fillStyle = ACC; octx.beginPath(); octx.roundRect(-w / 2, -h / 2, w, h, h * 0.18); octx.fill();
+  octx.fillStyle = '#fff'; octx.fillText('EMERGENT BEHAVIOUR', 0, H * 0.004);
+  octx.restore();
+}
+const bigger = {
+  beats: 3,
+  draw(beat, tb, ts) {
+    const R = run3d(beat < 2 ? D.sandbox.arch : D.sandbox.pillars);
+    let tt;
+    if (beat === 0) tt = clamp((tb - 0.4) * R.built / 9, 0, R.built - 0.001);                 // the build, in about 9 seconds
+    else if (beat === 1) tt = tb < 0.9 ? R.dmg - 1 : tb < 2.1 ? R.dmg + (tb - 0.9) / 1.2 * 0.999 // whole, then the cut drops away
+      : Math.min(R.t - 1.001, R.dmg + 1 + (tb - 2.1) * 14);                                     // then the spares rebuild it
+    else tt = clamp((tb - 0.4) * R.t / 9, 0, R.t - 1.001);
+    drawRun(R, tt, ts, 0.85);
+    title3d(beat, tb);
+    if (beat === 2) emergent(tb);
+  },
+};
+
+/* 6. From hand-written rules to a learned swarm: form, cut, repair, then 24 shapes it never trained on. */
+const learned = {
+  beats: 4,
+  draw(beat, tb, ts) {
+    const R = D.swarm.repair[0], s = Math.min(W, H) * 0.52, cx = W / 2, cy = H / 2;
+    if (beat < 3) {
+      const F = R.form, r = 0.33 * F.sp * s; seq(F);
+      if (!R.k) R.k = b64(R.keep, Uint8Array);
+      drawGhost(F, cx, cy, s, clamp(ts / 0.5));
+      if (beat === 0) dots(seqAt(F, ease(clamp(tb / 2.4))), F.n, cx, cy, s, r, INK);
+      else if (beat === 1) {
+        const P = seqAt(F, 1), [qx, qy, qr] = R.cut, a = clamp(tb / 0.25);
+        ctx.fillStyle = INK; ctx.beginPath();
+        for (let i = 0; i < F.n; i++) if (R.k[i]) { const x = cx + P[2 * i] * s, y = cy - P[2 * i + 1] * s; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 6.2832); }
+        ctx.fill();
+        const g = clamp((tb - 0.25) / 0.9), fall = g * g * 0.9 * s; ctx.fillStyle = ACC; ctx.globalAlpha = 1 - g; ctx.beginPath();   // removed bots fall away
+        for (let i = 0; i < F.n; i++) if (!R.k[i]) { const dx = P[2 * i] - qx, x = cx + (P[2 * i] + dx * g * 0.5) * s, y = cy - P[2 * i + 1] * s + fall * (0.6 + 0.8 * ((i * 37) % 11) / 11); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 6.2832); }
+        ctx.fill(); ctx.globalAlpha = 1;
+        ctx.strokeStyle = ACC; ctx.lineWidth = 0.008 * s; ctx.globalAlpha = a * (1 - clamp((tb - 1.3) / 0.6) * 0.75); ctx.setLineDash([0.03 * s, 0.025 * s]);
+        ctx.beginPath(); ctx.arc(cx + qx * s, cy - qy * s, qr * s * (1.25 - 0.25 * easeOut(a)), 0, 6.2832); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      } else { const Q = R.repair; dots(seqAt(Q, ease(clamp(tb / 2.6))), Q.n, cx, cy, s, r, INK); }
+      return;
+    }
+    const Wl = D.swarm.wall, cols = 6, rows = 4, cell = Math.min(W / cols, H / rows), x0 = (W - cell * cols) / 2, y0 = (H - cell * rows) / 2;
+    Wl.forEach((sq, i) => {
+      const c = i % cols, r_ = Math.floor(i / cols), px = x0 + (c + .5) * cell, py = y0 + (r_ + .5) * cell, sc = cell * 0.46;
+      const [, u] = cycle(Math.max(0, tb - 0.15 - 0.07 * (c + r_)), 2.4, 4.5, 1.0, 0.3);
+      drawGhost(sq, px, py, sc, clamp(tb / 0.5)); dots(seqAt(sq, u), sq.n, px, py, sc, 0.33 * sq.sp * sc, INK);
+    });
+  },
+};
+
+/* 7. What we want to build first: a flat, round bot that drives in any direction (three omni wheels). 40 of them, running the same policy. */
+const puck = {
+  beats: 3,
+  parts() {
+    if (this.P) return this.P;
+    const c = hex, P = [], ring3 = f => [0, 1, 2].forEach(i => f(i * 2.0944 + 0.5236));
+    const add = (m, model, col, lift) => P.push({ m, model, col: c(col), lift });
+    const radial = a => M.chain(M.rot([0, 0, 1], a), M.rot([0, 1, 0], Math.PI / 2));     // cylinder axis z -> pointing outwards
+    add(DISC, M.chain(M.tr(0, 0, 4.2), M.sc(40, 40, 2.6)), '#2a2d33', 0);                 // base plate
+    ring3(a => {
+      const cs = Math.cos(a), sn = Math.sin(a);
+      add(DISC, M.chain(M.tr(31 * cs, 31 * sn, 11), radial(a), M.sc(11, 11, 7)), '#3d424b', 0);       // omni wheel
+      add(DISC, M.chain(M.tr(31 * cs, 31 * sn, 11), radial(a), M.sc(4.2, 4.2, 8.4)), ACC, 0);         // hub
+      for (let k = 0; k < 10; k++) { const b = k / 10 * 6.2832;                                       // rollers round the rim
+        add(DISC, M.chain(M.tr(31 * cs, 31 * sn, 11), radial(a), M.rot([0, 0, 1], b), M.tr(10.4, 0, 0), M.rot([1, 0, 0], Math.PI / 2), M.sc(1.9, 1.9, 4.6)), '#8d939c', 0); }
+      add(DISC, M.chain(M.tr(16 * cs, 16 * sn, 11), radial(a), M.sc(5.6, 5.6, 19)), '#aeb4bd', 0);    // gearmotor
+    });
+    add(CUBE, M.chain(M.tr(0, 0, 21.5), M.sc(36, 24, 7)), '#dfe2e7', 17);                 // battery
+    add(DISC, M.chain(M.tr(0, 0, 28.4), M.sc(35.5, 35.5, 1.6)), ACC, 38);                 // circuit board
+    add(CUBE, M.chain(M.tr(0, 0, 30.1), M.sc(10, 10, 1.8)), '#22252b', 38);               // microcontroller
+    add(CUBE, M.chain(M.tr(15, 9, 29.9), M.sc(6, 4, 1.4)), '#22252b', 38); add(CUBE, M.chain(M.tr(-14, -11, 29.9), M.sc(5, 7, 1.4)), '#22252b', 38);
+    for (let k = 0; k < 8; k++) { const a = k / 8 * 6.2832 + 0.39; add(CUBE, M.chain(M.tr(31.5 * Math.cos(a), 31.5 * Math.sin(a), 30.9), M.rot([0, 0, 1], a), M.sc(3, 4.4, 3.4)), '#22252b', 38); }   // infrared ring
+    add(TUBE, M.chain(M.tr(0, 0, 22.5), M.sc(40, 40, 21)), '#2a2d33', 64);                // shell
+    add(DISC, M.chain(M.tr(0, 0, 34), M.sc(40, 40, 2)), '#e6e8ec', 96);                   // lid
+    add(DISC, M.chain(M.tr(0, 0, 36), M.sc(6.5, 6.5, 2.4)), ACC, 96);                     // light
+    return this.P = P;
+  },
+  enter() { this.e = 0; },
+  draw(beat, tb, ts) {
+    if (beat < 2) {
+      this.e = lerp(this.e, beat === 1 ? 1 : 0, 0.085); const e = this.e, pop = backOut(clamp(ts / 0.45));
+      shadow(W / 2, H * (0.80 + 0.06 * e), H * 0.40, H * 0.05, 0.13 - 0.05 * e);
+      begin3D(); orbit([0, 0, 18 + 48 * e], 235 + 250 * e, ts * 0.5 + 0.6, 0.42 - 0.12 * e, 0.5);
+      for (const p of this.parts()) draw(p.m, M.chain(M.sc(pop), M.tr(0, 0, p.lift * e), p.model), p.col);
+      return;
+    }
+    const S = D.swarm.pucks, [k, u] = cycle(Math.max(0, tb - 0.4), 2.6, 1.8, 1.2, 0.3), sq = S[k % S.length], P = seqAt(sq, u);
+    const s = Math.min(W, H) * 0.50, cx = W / 2, cy = H / 2, r = 0.35 * sq.sp * s, a = clamp(tb / 0.5);
+    ctx.globalAlpha = a; drawGhost(sq, cx, cy, s, a);
+    const pass = (dx, dy, rr, col) => { ctx.fillStyle = col; ctx.beginPath(); for (let i = 0; i < sq.n; i++) { const x = cx + P[2 * i] * s + dx, y = cy - P[2 * i + 1] * s + dy; ctx.moveTo(x + rr, y); ctx.arc(x, y, rr, 0, 6.2832); } ctx.fill(); };
+    pass(r * 0.10, r * 0.22, r * 1.03, 'rgba(15,18,28,0.16)'); pass(0, 0, r, '#2a2d33'); pass(0, 0, r * 0.84, '#e6e8ec'); pass(0, 0, r * 0.2, ACC);
+    ctx.globalAlpha = 1;
+  },
+};
+
+/* 8. The ask. The only slide with numbers. */
+const ICON = {
+  wheel(c) { c.beginPath(); c.arc(0, 0, .82, 0, 6.2832); c.moveTo(.26, 0); c.arc(0, 0, .26, 0, 6.2832); for (let i = 0; i < 3; i++) { const a = i * 2.0944 - 1.5708; c.moveTo(.26 * Math.cos(a), .26 * Math.sin(a)); c.lineTo(.82 * Math.cos(a), .82 * Math.sin(a)); } c.stroke(); },
+  chip(c) { c.beginPath(); c.roundRect(-.52, -.52, 1.04, 1.04, .12); for (const k of [-.28, 0, .28]) { c.moveTo(k, -.52); c.lineTo(k, -.86); c.moveTo(k, .52); c.lineTo(k, .86); c.moveTo(-.52, k); c.lineTo(-.86, k); c.moveTo(.52, k); c.lineTo(.86, k); } c.stroke(); c.beginPath(); c.roundRect(-.2, -.2, .4, .4, .05); c.stroke(); },
+  battery(c) { c.beginPath(); c.roundRect(-.86, -.44, 1.56, .88, .14); c.moveTo(.86, -.16); c.lineTo(.86, .16); c.stroke(); c.beginPath(); c.roundRect(-.62, -.2, .34, .4, .04); c.roundRect(-.16, -.2, .34, .4, .04); c.fill(); },
+  iterate(c) { c.beginPath(); c.arc(0, 0, .3, 0, 6.2832); c.fill(); c.beginPath(); c.arc(0, 0, .74, -1.2, 3.9); c.stroke(); c.beginPath(); c.moveTo(.27 + .3, -.69 - .12); c.lineTo(.27, -.69); c.lineTo(.27 + .08, -.69 + .33); c.stroke(); },
+  camera(c) { c.beginPath(); c.roundRect(-.5, -.86, 1, .56, .1); c.moveTo(-.2, -.3); c.lineTo(-.86, .82); c.moveTo(.2, -.3); c.lineTo(.86, .82); c.moveTo(-.86, .82); c.lineTo(.86, .82); c.stroke(); c.beginPath(); c.arc(0, -.58, .13, 0, 6.2832); c.fill(); },
+  box(c) { c.beginPath(); c.moveTo(0, -.84); c.lineTo(.78, -.42); c.lineTo(.78, .42); c.lineTo(0, .84); c.lineTo(-.78, .42); c.lineTo(-.78, -.42); c.closePath(); c.moveTo(-.78, -.42); c.lineTo(0, 0); c.lineTo(.78, -.42); c.moveTo(0, 0); c.lineTo(0, .84); c.stroke(); },
+};
+const money = v => '$' + Math.round(v).toLocaleString('en-US');
+const budget = {
+  beats: 1,
+  draw(beat, tb, ts) {
+    const items = BUDGET.items, total = items.reduce((a, b) => a + b[1], 0), max = Math.max(...items.map(i => i[1]));
+    const font = (px, w = 700) => `${w} ${px}px "Inter","SF Pro Display",-apple-system,"Helvetica Neue",Arial,sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = INK;
+    const k = easeOut(clamp(ts / 1.1));
+    ctx.font = font(H * 0.27); ctx.letterSpacing = `${-H * 0.008}px`; ctx.fillText(money(total * k), W / 2, H * 0.37);
+    ctx.letterSpacing = '0px';
+    /* 40 x puck */
+    const a0 = clamp((ts - 0.15) / 0.4), py = H * 0.135, pr = H * 0.030; ctx.globalAlpha = a0;
+    ctx.font = font(H * 0.058, 600); ctx.fillStyle = MID; ctx.textAlign = 'right'; ctx.fillText(`${BUDGET.bots} ×`, W / 2 - pr * 0.2, py + H * 0.003); ctx.textAlign = 'center';
+    const px = W / 2 + pr * 1.7; ctx.fillStyle = '#2a2d33'; ctx.beginPath(); ctx.arc(px, py, pr, 0, 6.2832); ctx.fill(); ctx.fillStyle = '#e6e8ec'; ctx.beginPath(); ctx.arc(px, py, pr * .84, 0, 6.2832); ctx.fill(); ctx.fillStyle = ACC; ctx.beginPath(); ctx.arc(px, py, pr * .2, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 1;
+    const n = items.length, tw = Math.min(W * 0.148, H * 0.3), x0 = W / 2 - tw * n / 2;
+    items.forEach(([ic, v], i) => {
+      const a = easeOut(clamp((ts - 0.5 - i * 0.1) / 0.5)), x = x0 + (i + .5) * tw, y = H * 0.665 + (1 - a) * H * 0.02; ctx.globalAlpha = a;
+      ctx.save(); ctx.translate(x, y); ctx.scale(H * 0.042, H * 0.042); ctx.lineWidth = 0.1; ctx.lineCap = ctx.lineJoin = 'round'; ctx.strokeStyle = ctx.fillStyle = INK; ICON[ic](ctx); ctx.restore();
+      ctx.fillStyle = INK; ctx.font = font(H * 0.048); ctx.fillText(money(v * a), x, y + H * 0.105);
+      const bw = tw * 0.72, bh = H * 0.008, by = y + H * 0.158; ctx.fillStyle = GHOST; ctx.beginPath(); ctx.roundRect(x - bw / 2, by, bw, bh, bh / 2); ctx.fill();
+      ctx.fillStyle = ACC; ctx.beginPath(); ctx.roundRect(x - bw / 2, by, Math.max(bh, bw * v / max * a), bh, bh / 2); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  },
+};
+
+/* ================================================================== RUNNER ================================================================== */
+const SCENES = [hero, origins, cad, linking, bigger, learned, puck, budget];
+let si = 0, beat = 0, tScene = 0, tBeat = 0, last = performance.now();
+function go(s, b) { si = clamp(s, 0, SCENES.length - 1); tScene = 0; SCENES[si].enter?.(); beat = clamp(b, 0, SCENES[si].beats - 1); tBeat = 0; }
+function next() { if (beat + 1 < SCENES[si].beats) { beat++; tBeat = 0; } else if (si + 1 < SCENES.length) go(si + 1, 0); }
+function back() { if (beat > 0) { beat--; tBeat = 0; } else if (si > 0) { si--; tScene = 0; SCENES[si].enter?.(); beat = SCENES[si].beats - 1; tBeat = 0; } }
+function fullscreen() { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.(); }
+
+/* Sync (sync.js): followers only move when the presenter does; a lead also tells everyone. */
+const ROLE = window.SYNC?.role ?? 'solo';
+function nav(f, ...a) { if (ROLE === 'follow') return; f(...a); if (ROLE === 'lead') SYNC.send(si, beat); }
+function setPos(s, b) { if (s !== si) go(s, b); else if (b !== beat) { beat = clamp(b, 0, SCENES[si].beats - 1); tBeat = 0; } }
+if (ROLE !== 'solo') SYNC.listen(setPos);
+
+addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if ([' ', 'ArrowRight', 'ArrowDown', 'PageDown', 'Enter'].includes(e.key)) { e.preventDefault(); nav(next); }
+  else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(e.key)) { e.preventDefault(); nav(back); }
+  else if (e.key === 'f' || e.key === 'F') fullscreen();
+  else if (e.key === 'Home') nav(go, 0, 0);
+  else if (e.key === 'End') nav(go, SCENES.length - 1, 0);
+  else if (/^[1-9]$/.test(e.key)) nav(go, +e.key - 1, 0);
+});
+addEventListener('pointerdown', e => { if (e.button === 0) { if (ROLE !== 'follow') nav(next); else if (!document.fullscreenElement) fullscreen(); } });
+addEventListener('contextmenu', e => { e.preventDefault(); nav(back); });
+let idle; addEventListener('pointermove', () => { document.body.classList.remove('idle'); clearTimeout(idle); idle = setTimeout(() => document.body.classList.add('idle'), 1500); });
+
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now; tScene += dt; tBeat += dt;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, W, H);
+  gl.viewport(0, 0, W, H); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  SCENES[si].draw(beat, tBeat, tScene);
+  stage.style.opacity = clamp(tScene / 0.3);
+  requestAnimationFrame(frame);
+}
+for (const k in D.cad) { const c = D.cad[k]; c.m = mesh(b64(c.pos, Int16Array), b64(c.idx, Uint32Array), gl.SHORT, true); c.pos = c.idx = null; }   // upload the CAD once, up front
+window.DECK = { go, next, back, setPos, state: () => ({ si, beat, tScene, tBeat }) };
+SCENES[0].enter?.(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
